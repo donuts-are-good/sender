@@ -2,14 +2,18 @@ package main
 
 import (
 	"encoding/gob"
+	"flag"
 	"fmt"
+	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 type Message struct {
 	From    string
-	Content string
+	Relay   string
+	Content []byte
 }
 
 type Node struct {
@@ -69,12 +73,57 @@ func (n *Node) SendMessage(msg Message) {
 }
 
 func main() {
-	node := NewNode(":9000")
+	relayPort := flag.String("enable-relay", "", "Enable public relay at the specified port")
+	ourPort := flag.String("port", "14000", "Set our listening port (default: 14000)")
+	flag.Parse()
+
+	if *relayPort != "" {
+		go func() {
+			ln, err := net.Listen("tcp", ":"+*relayPort)
+			if err != nil {
+				panic(err)
+			}
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					continue
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					remote, err := net.Dial("tcp", conn.RemoteAddr().String())
+					if err != nil {
+						return
+					}
+					defer remote.Close()
+					go func() { _, _ = io.Copy(conn, remote) }()
+					_, _ = io.Copy(remote, conn)
+				}(conn)
+			}
+		}()
+	}
+
+	node := NewNode(":" + *ourPort)
 	go node.Listen()
 
-	node.Connect("10.0.0.2:9000")
-	node.Connect("10.0.0.3:9000")
+	switch *ourPort {
+	case "14000":
+		node.Connect("127.0.0.1:14001")
+		node.Connect("127.0.0.1:14002")
+	case "14001":
+		node.Connect("127.0.0.1:14000")
+		node.Connect("127.0.0.1:14002")
+	case "14002":
+		node.Connect("127.0.0.1:14000")
+		node.Connect("127.0.0.1:14001")
+	default:
+		fmt.Println("Invalid port specified.")
+		return
+	}
 
-	msg := Message{"Node1", "Hello, World!"}
-	node.SendMessage(msg)
+	// why isn't this sending messages continuously?
+	for {
+		msg := Message{*ourPort, "", []byte("Hello :) " + time.Now().String())}
+		node.SendMessage(msg)
+	}
+	// select {}
 }
