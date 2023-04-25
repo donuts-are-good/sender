@@ -1,31 +1,108 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/gob"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-type Message struct {
-	From    string
-	Relay   string
-	Content []byte
+type Node struct {
+	ID        ed25519.PublicKey
+	Signature []byte
+	Addr      *net.TCPAddr
 }
 
-type Node struct {
+type Message struct {
+	Topic     string
+	From      *Node
+	Relay     *Node
+	Content   []byte
+	Signature []byte
+}
+
+type Network struct {
 	addr  string
 	conns map[string]net.Conn
+	node  *Node
 }
 
-func NewNode(addr string) *Node {
-	return &Node{addr, make(map[string]net.Conn)}
+func main() {
+	relayPort := flag.String("enable-relay", "", "Enable public relay at the specified port")
+	ourPort := flag.String("port", "14000", "Set our listening port (default: 14000)")
+	local := flag.Bool("local", false, "Use 127.0.0.1 for testing purposes")
+	flag.Parse()
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+
+	_, externalIP, err := GetIPs()
+	if err != nil {
+		panic(err)
+	}
+
+	if *local {
+		externalIP = net.ParseIP("127.0.0.1")
+	}
+
+	node := &Node{
+		ID:   publicKey,
+		Addr: &net.TCPAddr{IP: externalIP, Port: 14000},
+	}
+	node.Signature = ed25519.Sign(privateKey, publicKey)
+
+	network := NewNetwork(":"+*ourPort, node)
+
+	if *relayPort != "" {
+		relayPortInt, err := strconv.Atoi(*relayPort)
+		if err != nil {
+			panic(err)
+		}
+		relayNode := &Node{
+			ID:   publicKey,
+			Addr: &net.TCPAddr{IP: externalIP, Port: relayPortInt},
+		}
+		relayNode.Signature = ed25519.Sign(privateKey, publicKey)
+
+		relayNetwork := NewNetwork(":"+*relayPort, relayNode)
+		go relayNetwork.Listen()
+	}
+
+	go network.Listen()
+
+	// Connect to other nodes and send messages
+	ourPortInt, err := strconv.Atoi(*ourPort)
+	if err != nil {
+		panic(err)
+	}
+
+	delayBetweenMessages := time.Second * 5 // Adjust the delay as needed
+
+	for i := 14000; i <= 14002; i++ {
+		if i != ourPortInt {
+			peerAddr := fmt.Sprintf("127.0.0.1:%d", i)
+			network.Connect(peerAddr)
+			go sendMessageContinuously(network, peerAddr, delayBetweenMessages, privateKey)
+		}
+	}
+
+	select {}
 }
 
-func (n *Node) Listen() {
+func NewNetwork(addr string, node *Node) *Network {
+	return &Network{addr, make(map[string]net.Conn), node}
+}
+
+func (n *Network) Listen() {
 	ln, err := net.Listen("tcp", n.addr)
 	if err != nil {
 		panic(err)
@@ -39,19 +116,37 @@ func (n *Node) Listen() {
 	}
 }
 
-func (n *Node) handleConn(conn net.Conn) {
+func (n *Network) handleConn(conn net.Conn) {
+	defer conn.Close()
 	dec := gob.NewDecoder(conn)
+
 	for {
 		var msg Message
 		err := dec.Decode(&msg)
-		if err != nil {
-			return
+		if err == io.EOF {
+			// Connection closed, exit the loop
+			break
+		} else if err != nil {
+			fmt.Printf("Error decoding message: %v\n", err)
+			continue
 		}
-		fmt.Printf("%s: %s\n", msg.From, msg.Content)
+
+		if !ed25519.Verify(msg.From.ID, msg.Content, msg.Signature) {
+			fmt.Println("Invalid message signature!")
+			continue
+		}
+
+		fmt.Printf("%s: %s\n", msg.From.ID, msg.Content)
 	}
 }
 
-func (n *Node) Connect(addr string) {
+func sendMessageContinuously(network *Network, peerAddr string, delay time.Duration, privkey ed25519.PrivateKey) {
+	for {
+		network.SendMessage("general", []byte(fmt.Sprintf("Hello, %s!", peerAddr)), privkey)
+		time.Sleep(delay)
+	}
+}
+func (n *Network) Connect(addr string) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return
@@ -59,7 +154,14 @@ func (n *Node) Connect(addr string) {
 	n.conns[addr] = conn
 }
 
-func (n *Node) SendMessage(msg Message) {
+func (n *Network) SendMessage(topic string, content []byte, privkey ed25519.PrivateKey) {
+	msg := Message{
+		Topic:   topic,
+		From:    n.node,
+		Content: content,
+	}
+	msg.Signature = ed25519.Sign(privkey, content)
+
 	var wg sync.WaitGroup
 	for _, conn := range n.conns {
 		wg.Add(1)
@@ -72,58 +174,22 @@ func (n *Node) SendMessage(msg Message) {
 	wg.Wait()
 }
 
-func main() {
-	relayPort := flag.String("enable-relay", "", "Enable public relay at the specified port")
-	ourPort := flag.String("port", "14000", "Set our listening port (default: 14000)")
-	flag.Parse()
+func GetIPs() (net.IP, net.IP, error) {
+	conn, err := net.Dial("tcp", "icanhazip.com:80")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Close()
 
-	if *relayPort != "" {
-		go func() {
-			ln, err := net.Listen("tcp", ":"+*relayPort)
-			if err != nil {
-				panic(err)
-			}
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					continue
-				}
-				go func(conn net.Conn) {
-					defer conn.Close()
-					remote, err := net.Dial("tcp", conn.RemoteAddr().String())
-					if err != nil {
-						return
-					}
-					defer remote.Close()
-					go func() { _, _ = io.Copy(conn, remote) }()
-					_, _ = io.Copy(remote, conn)
-				}(conn)
-			}
-		}()
+	internalIP := conn.LocalAddr().(*net.TCPAddr).IP
+
+	// Send request to icanhazip.com
+	fmt.Fprintf(conn, "GET / HTTP/1.0\r\nHost: icanhazip.com\r\n\r\n")
+	resp, err := io.ReadAll(conn)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	node := NewNode(":" + *ourPort)
-	go node.Listen()
-
-	switch *ourPort {
-	case "14000":
-		node.Connect("127.0.0.1:14001")
-		node.Connect("127.0.0.1:14002")
-	case "14001":
-		node.Connect("127.0.0.1:14000")
-		node.Connect("127.0.0.1:14002")
-	case "14002":
-		node.Connect("127.0.0.1:14000")
-		node.Connect("127.0.0.1:14001")
-	default:
-		fmt.Println("Invalid port specified.")
-		return
-	}
-
-	// why isn't this sending messages continuously?
-	for {
-		msg := Message{*ourPort, "", []byte("Hello :) " + time.Now().String())}
-		node.SendMessage(msg)
-	}
-	// select {}
+	externalIP := net.ParseIP(strings.TrimSpace(string(resp)))
+	return internalIP, externalIP, nil
 }
